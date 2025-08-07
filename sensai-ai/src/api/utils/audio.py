@@ -8,6 +8,8 @@ import wave
 import ssl
 import urllib.request
 import statistics
+import math
+from typing import List, Dict, Tuple, Optional
 from api.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -597,6 +599,457 @@ def analyze_whisper_metrics(whisper_result) -> dict:
         }
 
 
+def _trimmed_mean(values: List[float], lower: float = 0.1, upper: float = 0.9) -> float:
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    lo_idx = int(math.floor(n * lower))
+    hi_idx = int(math.ceil(n * upper))
+    hi_idx = max(lo_idx + 1, min(hi_idx, n))
+    trimmed = sorted_vals[lo_idx:hi_idx]
+    return sum(trimmed) / len(trimmed) if trimmed else sum(sorted_vals) / n
+
+
+def _median(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    m = len(s)
+    mid = m // 2
+    if m % 2 == 0:
+        return (s[mid - 1] + s[mid]) / 2.0
+    return s[mid]
+
+
+def _mad(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    med = _median(values)
+    deviations = [abs(v - med) for v in values]
+    return _median(deviations)
+
+
+def _std(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    m = sum(values) / len(values)
+    return (sum((v - m) ** 2 for v in values) / len(values)) ** 0.5
+
+
+def _clip(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _map_inverse(value: float, good: float, bad: float, out_min: float = 0.0, out_max: float = 5.0) -> float:
+    if value <= good:
+        return out_max
+    if value >= bad:
+        return out_min
+    ratio = (value - good) / (bad - good)
+    return _clip(out_max * (1.0 - ratio), out_min, out_max)
+
+
+def _band_score(x: float, opt_low: float, opt_high: float, min_x: float, max_x: float, out_min: float = 0.0, out_max: float = 5.0) -> float:
+    if x <= min_x or x >= max_x:
+        return out_min
+    if opt_low <= x <= opt_high:
+        return out_max
+    if x < opt_low:
+        return out_min + (x - min_x) / (opt_low - min_x) * (out_max - out_min)
+    return out_min + (max_x - x) / (max_x - opt_high) * (out_max - out_min)
+
+
+def _collect_words(whisper_result) -> Tuple[List[Dict], List[Dict]]:
+    segments = whisper_result.get("segments", [])
+    words: List[Dict] = []
+    seg_meta: List[Dict] = []
+    for idx, seg in enumerate(segments):
+        seg_meta.append({
+            "idx": idx,
+            "avg_logprob": seg.get("avg_logprob", -1.0)
+        })
+        for widx, w in enumerate(seg.get("words", [])):
+            words.append({
+                "text": (w.get("word", "").strip() or ""),
+                "start": w.get("start", 0.0),
+                "end": w.get("end", 0.0),
+                "prob": w.get("probability", None),
+                "seg_idx": idx,
+                "widx": widx,
+            })
+    return words, seg_meta
+
+
+def _derive_prob_from_logprob(avg_logprob: float) -> float:
+    # Map Whisper avg_logprob from ~[-3.0, 0.0] to [0,1]
+    low, high = -3.0, -0.05
+    return _clip((avg_logprob - low) / (high - low), 0.0, 1.0)
+
+
+def _normalize_word_confidences(words: List[Dict], seg_meta: List[Dict]) -> List[float]:
+    seg_idx_to_prob = {s["idx"]: _derive_prob_from_logprob(s["avg_logprob"]) for s in seg_meta}
+    probs: List[float] = []
+    for w in words:
+        p = w.get("prob")
+        if p is None:
+            p = seg_idx_to_prob.get(w["seg_idx"], 0.5)
+        probs.append(_clip(float(p), 0.0, 1.0))
+    return probs
+
+
+def _inter_word_gaps(words: List[Dict]) -> List[float]:
+    gaps: List[float] = []
+    for i in range(1, len(words)):
+        prev_end = float(words[i - 1].get("end", 0.0))
+        cur_start = float(words[i].get("start", 0.0))
+        gap = cur_start - prev_end
+        if 0.05 <= gap <= 1.0:
+            gaps.append(gap)
+    return gaps
+
+
+def _detect_fillers(words: List[Dict]) -> Tuple[int, Dict[str, int]]:
+    # Boundary-aware detection for common fillers
+    multi_fillers = {
+        ("you", "know"): "hedge",
+        ("i", "mean"): "hedge",
+        ("kind", "of"): "hedge",
+        ("sort", "of"): "hedge",
+    }
+    single_fillers = {
+        "um": "basic",
+        "uh": "basic",
+        "er": "basic",
+        "ah": "basic",
+        "hmm": "basic",
+        # "like" handled specially
+    }
+
+    total = 0
+    breakdown: Dict[str, int] = {"basic": 0, "hedge": 0, "transition": 0, "emphasis": 0}
+    i = 0
+    n = len(words)
+    while i < n:
+        w = words[i]
+        txt = w.get("text", "").strip().lower()
+        # multi-word detection first
+        if i + 1 < n:
+            pair = (txt, words[i + 1].get("text", "").strip().lower())
+            if pair in multi_fillers:
+                breakdown[multi_fillers[pair]] += 1
+                total += 1
+                i += 2
+                continue
+        # single-word detection
+        if txt in single_fillers:
+            breakdown[single_fillers[txt]] += 1
+            total += 1
+            i += 1
+            continue
+        if txt == "like":
+            # treat as filler only if surrounded by pauses >= 0.15s
+            pre_gap = words[i]["start"] - (words[i - 1]["end"] if i > 0 else words[i]["start"]) if i > 0 else 0.0
+            post_gap = (words[i + 1]["start"] - words[i]["end"]) if i + 1 < n else 0.0
+            if pre_gap >= 0.15 and post_gap >= 0.15:
+                breakdown["transition"] += 1
+                total += 1
+                i += 1
+                continue
+        i += 1
+    return total, breakdown
+
+
+def _detect_repetitions(words: List[Dict]) -> float:
+    if len(words) < 2:
+        return 0.0
+    repeats = 0
+    for i in range(1, len(words)):
+        cur = words[i]
+        prev = words[i - 1]
+        if cur.get("text", "").strip().lower() == prev.get("text", "").strip().lower():
+            if (cur.get("start", 0.0) - prev.get("end", 0.0)) < 0.5:
+                repeats += 1
+    return repeats / max(1, len(words))
+
+
+def _frame_rms(samples: bytes, sample_width: int) -> float:
+    if sample_width == 2:
+        # 16-bit PCM
+        import struct
+        count = len(samples) // 2
+        if count == 0:
+            return 0.0
+        unpacked = struct.unpack("<" + ("h" * count), samples)
+        mean_sq = sum(x * x for x in unpacked) / count
+        return math.sqrt(mean_sq) / 32768.0
+    # Fallback: average absolute value normalized by max byte
+    if not samples:
+        return 0.0
+    return sum(abs(b - 128) for b in samples) / (len(samples) * 128.0)
+
+
+def _vad_and_snr(audio_path: str, frame_ms: int = 20) -> Tuple[float, float]:
+    try:
+        with wave.open(audio_path, "rb") as wf:
+            sample_rate = wf.getframerate()
+            nchannels = wf.getnchannels()
+            sw = wf.getsampwidth()
+            total_frames = wf.getnframes()
+            frame_len = int(sample_rate * frame_ms / 1000)
+            voiced_rms: List[float] = []
+            unvoiced_rms: List[float] = []
+            voiced_frames = 0
+            total_time = total_frames / float(sample_rate)
+
+            # Read frames channel-agnostic by taking first channel for simplicity
+            # Process chunk by chunk
+            while True:
+                frames = wf.readframes(frame_len)
+                if not frames:
+                    break
+                # If stereo, take first channel
+                if nchannels > 1 and sw == 2:
+                    import array
+                    arr = array.array('h', frames)
+                    frames = arr[0::nchannels].tobytes()
+
+                rms = _frame_rms(frames, sw)
+                unvoiced_rms.append(rms)
+
+            if not unvoiced_rms or total_time <= 0:
+                return 0.0, 0.0
+
+            # Determine threshold at 60th percentile for voiced
+            sorted_rms = sorted(unvoiced_rms)
+            thr = sorted_rms[int(0.60 * len(sorted_rms))]
+            # Rewind and classify voiced frames
+            wf.rewind()
+            while True:
+                frames = wf.readframes(frame_len)
+                if not frames:
+                    break
+                if nchannels > 1 and sw == 2:
+                    import array
+                    arr = array.array('h', frames)
+                    frames = arr[0::nchannels].tobytes()
+                rms = _frame_rms(frames, sw)
+                if rms >= thr:
+                    voiced_rms.append(rms)
+                    voiced_frames += 1
+                else:
+                    unvoiced_rms.append(rms)
+
+            speech_seconds = voiced_frames * (frame_ms / 1000.0)
+            if not voiced_rms:
+                return 0.0, 0.0
+
+            # SNR estimate using medians for robustness
+            speech_level = _median(voiced_rms)
+            if unvoiced_rms:
+                noise_level = _median(sorted(unvoiced_rms)[: max(1, int(0.2 * len(unvoiced_rms)))])
+            else:
+                noise_level = max(1e-6, 0.001)
+            noise_level = max(noise_level, 1e-6)
+            snr = 20.0 * math.log10(max(speech_level, noise_level + 1e-6) / noise_level)
+            return speech_seconds, snr
+    except Exception:
+        return 0.0, 0.0
+
+
+def _map_snr_to_5(snr_db: float) -> float:
+    # Piecewise linear: 0->1, 5->2, 10->3, 20->4, 30->5
+    points = [(0, 1), (5, 2), (10, 3), (20, 4), (30, 5)]
+    if snr_db <= points[0][0]:
+        return points[0][1]
+    for (x1, y1), (x2, y2) in zip(points, points[1:]):
+        if x1 <= snr_db <= x2:
+            t = (snr_db - x1) / (x2 - x1)
+            return y1 + t * (y2 - y1)
+    return points[-1][1]
+
+
+def analyze_whisper_metrics_v2(whisper_result, audio_path: Optional[str] = None) -> dict:
+    try:
+        words, seg_meta = _collect_words(whisper_result)
+        confidences = _normalize_word_confidences(words, seg_meta)
+        total_words = len(words)
+
+        # Confidence metrics (robust)
+        conf_trim = _trimmed_mean(confidences, 0.1, 0.9)
+        conf_mad = _mad(confidences)
+        conf_score = _clip(conf_trim, 0.0, 1.0)
+
+        # Stability label
+        if conf_mad < 0.05:
+            stability = "very stable"
+        elif conf_mad < 0.10:
+            stability = "mostly stable"
+        else:
+            stability = "variable"
+
+        # Percentiles and trend
+        conf_sorted = sorted(confidences)
+        if conf_sorted:
+            n = len(conf_sorted)
+            p25 = conf_sorted[int(0.25 * n)]
+            p50 = conf_sorted[int(0.50 * n)]
+            p75 = conf_sorted[int(0.75 * n)]
+            p90 = conf_sorted[int(0.90 * n)]
+            conf_percentiles = f"P25:{p25:.2f} P50:{p50:.2f} P75:{p75:.2f} P90:{p90:.2f}"
+        else:
+            conf_percentiles = "unknown"
+
+        if len(confidences) >= 3:
+            third = max(1, len(confidences) // 3)
+            first_third = sum(confidences[:third]) / third
+            last_third = sum(confidences[-third:]) / third
+            trend_delta = last_third - first_third
+            if trend_delta > 0.1:
+                conf_trend = f"improving (+{trend_delta:.2f})"
+            elif trend_delta < -0.1:
+                conf_trend = f"declining ({trend_delta:.2f})"
+            else:
+                conf_trend = "stable"
+        else:
+            conf_trend = "unknown"
+
+        # Timing smoothness
+        gaps = _inter_word_gaps(words)
+        if gaps and sum(gaps) > 0:
+            gaps_mean = sum(gaps) / len(gaps)
+            gaps_std = _std(gaps)
+            cv = gaps_std / gaps_mean if gaps_mean > 0 else 1.0
+        else:
+            cv = 1.0
+        smoothness_score = _map_inverse(cv, good=0.25, bad=0.6, out_min=0.0, out_max=5.0)
+
+        # Pace via simple VAD on audio_path if provided
+        if audio_path:
+            speech_seconds, snr_db = _vad_and_snr(audio_path)
+        else:
+            speech_seconds, snr_db = 0.0, 0.0
+
+        if speech_seconds > 0 and total_words > 0:
+            wpm = (total_words / speech_seconds) * 60.0
+            pace_score = _band_score(wpm, opt_low=140.0, opt_high=170.0, min_x=90.0, max_x=210.0, out_min=0.0, out_max=5.0)
+            if wpm < 120:
+                pace_text = f"slow ({wpm:.0f} WPM)"
+            elif wpm > 200:
+                pace_text = f"fast ({wpm:.0f} WPM)"
+            else:
+                pace_text = f"excellent pace ({wpm:.0f} WPM)"
+        else:
+            wpm = 0.0
+            pace_score = 0.0
+            pace_text = "unable to calculate"
+
+        # Fillers and repetitions
+        filler_total, filler_breakdown = _detect_fillers(words)
+        filler_rate = (filler_total / total_words) if total_words > 0 else 0.0
+        filler_score = _map_inverse(filler_rate, good=0.02, bad=0.10, out_min=0.0, out_max=5.0)
+        repetition_ratio = _detect_repetitions(words)
+        repetition_score = _map_inverse(repetition_ratio, good=0.01, bad=0.05, out_min=0.0, out_max=5.0)
+
+        fluency_score = (
+            0.35 * smoothness_score + 0.30 * pace_score + 0.25 * filler_score + 0.10 * repetition_score
+        )
+
+        if fluency_score >= 4.5:
+            fluency_text = f"exceptional fluency ({fluency_score:.1f}/5.0)"
+        elif fluency_score >= 4.0:
+            fluency_text = f"excellent fluency ({fluency_score:.1f}/5.0)"
+        elif fluency_score >= 3.5:
+            fluency_text = f"very good fluency ({fluency_score:.1f}/5.0)"
+        elif fluency_score >= 3.0:
+            fluency_text = f"good fluency ({fluency_score:.1f}/5.0)"
+        elif fluency_score >= 2.5:
+            fluency_text = f"fair fluency ({fluency_score:.1f}/5.0)"
+        else:
+            fluency_text = f"poor fluency ({fluency_score:.1f}/5.0)"
+
+        # Pronunciation clarity
+        long_word_confs = [c for c, w in zip(confidences, words) if len(w.get("text", "").strip()) >= 6]
+        long_conf = _trimmed_mean(long_word_confs, 0.1, 0.9) if long_word_confs else conf_score
+        if long_word_confs:
+            var_long = _std(long_word_confs)
+        else:
+            var_long = _std(confidences)
+        consistency_component = _map_inverse(var_long, good=0.10, bad=0.25, out_min=0.0, out_max=5.0)
+        snr_component = _map_snr_to_5(snr_db)
+        short_low_ratio = 0.0
+        if total_words > 0:
+            short_low = sum(1 for c, w in zip(confidences, words) if len(w.get("text", "")) < 3 and c < 0.5)
+            short_low_ratio = short_low / total_words
+        short_word_component = _map_inverse(short_low_ratio, good=0.02, bad=0.12, out_min=0.0, out_max=5.0)
+
+        clarity_score = 0.40 * (long_conf * 5.0) + 0.25 * consistency_component + 0.25 * snr_component + 0.10 * short_word_component
+        if clarity_score >= 4.5:
+            pronunciation_text = f"exceptional pronunciation clarity ({clarity_score:.1f}/5.0)"
+        elif clarity_score >= 4.0:
+            pronunciation_text = f"excellent pronunciation clarity ({clarity_score:.1f}/5.0)"
+        elif clarity_score >= 3.5:
+            pronunciation_text = f"very good pronunciation clarity ({clarity_score:.1f}/5.0)"
+        elif clarity_score >= 3.0:
+            pronunciation_text = f"good pronunciation clarity ({clarity_score:.1f}/5.0)"
+        elif clarity_score >= 2.5:
+            pronunciation_text = f"fair pronunciation clarity ({clarity_score:.1f}/5.0)"
+        else:
+            pronunciation_text = f"poor pronunciation clarity ({clarity_score:.1f}/5.0)"
+
+        # Overall confidence label
+        if conf_score >= 0.85:
+            overall_conf_text = "excellent"
+        elif conf_score >= 0.75:
+            overall_conf_text = "very good"
+        elif conf_score >= 0.65:
+            overall_conf_text = "good"
+        elif conf_score >= 0.55:
+            overall_conf_text = "fair"
+        else:
+            overall_conf_text = "needs improvement"
+
+        # Performance flags / suggestions
+        flags = []
+        improvements = []
+        if filler_rate > 0.08:
+            flags.append("excessive_fillers")
+            improvements.append("reduce filler words")
+        if cv > 0.6:
+            flags.append("irregular_rhythm")
+            improvements.append("practice timing and pacing")
+        if speech_seconds > 0 and (wpm < 120 or wpm > 200):
+            flags.append("suboptimal_pace")
+            improvements.append("adjust speaking pace")
+
+        return {
+            "overall_confidence": overall_conf_text,
+            "confidence_score": round(conf_score, 2),
+            "confidence_stability": stability,
+            "confidence_trend": conf_trend,
+            "confidence_percentiles": conf_percentiles,
+            "speaking_fluency": fluency_text,
+            "fluency_score": round(fluency_score, 2),
+            "pace_analysis": pace_text,
+            "pace_score": round(pace_score, 2),
+            "speech_rhythm": f"cv={cv:.2f}",
+            "pause_patterns": "n/a",  # simplified in v2 core
+            "filler_analysis": f"rate={filler_rate*100:.1f}%",
+            "pronunciation_clarity": pronunciation_text,
+            "clarity_score": round(clarity_score, 2),
+            "comparative_analysis": "performance_level: n/a",
+            "performance_indicators": ", ".join(flags) if flags else "strong_performance",
+            "improvement_metrics": " | ".join(improvements) if improvements else "maintain_current_level",
+        }
+    except Exception as e:
+        logger.warning(f"Error in analyze_whisper_metrics_v2: {e}")
+        return {
+            "overall_confidence": "analysis unavailable",
+            "speaking_fluency": "analysis unavailable",
+            "pronunciation_clarity": "analysis unavailable",
+        }
+
+
 def format_transcription_for_user(whisper_result) -> str:
     """
     Format transcription for immediate display to user (clean, readable format)
@@ -847,7 +1300,7 @@ def transcribe_audio_with_whisper(audio_data: bytes) -> str:
                 word_timestamps=True,  # Enable word-level timestamps
                 temperature=0.0,  # Deterministic for consistent confidence scores
                 beam_size=5,  # Use beam search for better accuracy
-                best_of=5,  # Consider multiple candidates
+                best_of=1,  # Deterministic selection
                 condition_on_previous_text=True,  # Better context
                 compression_ratio_threshold=2.4,  # Detect hallucination
                 logprob_threshold=-1.0,  # Confidence threshold
@@ -866,18 +1319,35 @@ def transcribe_audio_with_whisper(audio_data: bytes) -> str:
             
             # Show transcription immediately to user
             user_transcription = format_transcription_for_user(result)
-            
-            # Analyze Whisper's output metrics for advanced insights
-            whisper_metrics = analyze_whisper_metrics(result)
-            
+
+            # Analyze Whisper's output metrics using v2 (default)
+            whisper_metrics = analyze_whisper_metrics_v2(result, temp_audio_path)
+
+            # Optional: rubric + tips (content/structure via LLM, clarity/delivery via metrics)
+            rubric_and_tips = None
+            try:
+                from api.utils.feedback import generate_rubric_and_tips_sync
+                rubric_and_tips = generate_rubric_and_tips_sync(result, whisper_metrics)
+            except Exception as _:
+                rubric_and_tips = None
+
             # Format comprehensive analysis for AI
             formatted_transcript = format_transcript_for_feedback(result, audio_analysis, whisper_metrics)
-            
-            # Return both user transcription and full analysis
-            return {
+
+            payload = {
                 "user_transcription": user_transcription,
-                "ai_analysis": formatted_transcript
+                "ai_analysis": formatted_transcript,
             }
+            if rubric_and_tips is not None:
+                payload["rubric"] = {
+                    "content": rubric_and_tips.content,
+                    "structure": rubric_and_tips.structure,
+                    "clarity": rubric_and_tips.clarity,
+                    "delivery": rubric_and_tips.delivery,
+                }
+                payload["tips"] = [t.model_dump() for t in rubric_and_tips.tips]
+
+            return payload
             
         finally:
             # Clean up the temporary file

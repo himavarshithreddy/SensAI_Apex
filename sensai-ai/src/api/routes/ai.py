@@ -80,13 +80,13 @@ def get_user_audio_message_for_chat_history(uuid: str) -> List[Dict]:
     # Transcribe using OpenAI Whisper API
     try:
         transcription_result = transcribe_audio_with_whisper(audio_data)
-        
-        # Handle new return format (dict with user_transcription and ai_analysis)
+
+        # Handle new return format (dict with transcript, analysis, optional rubric & tips)
         if isinstance(transcription_result, dict):
             user_transcription = transcription_result.get("user_transcription", "")
             ai_analysis = transcription_result.get("ai_analysis", "")
-            
-            return [
+
+            messages = [
                 {
                     "type": "text",
                     "text": user_transcription,  # Show user the clean transcription first
@@ -94,8 +94,31 @@ def get_user_audio_message_for_chat_history(uuid: str) -> List[Dict]:
                 {
                     "type": "text",
                     "text": f"Student's Response: {ai_analysis}",  # Send comprehensive analysis to AI
-                }
+                },
             ]
+
+            rubric = transcription_result.get("rubric")
+            tips = transcription_result.get("tips") or []
+            if rubric or tips:
+                tips_lines = []
+                if rubric:
+                    tips_lines.append(
+                        f"Rubric Scores: Content {rubric.get('content', 0)}/5, Structure {rubric.get('structure', 0)}/5, Clarity {rubric.get('clarity', 0)}/5, Delivery {rubric.get('delivery', 0)}/5"
+                    )
+                if tips:
+                    tips_lines.append("Tips:")
+                    for idx, t in enumerate(tips[:3], start=1):
+                        ts = t.get("timestamp", "??:??")
+                        line = t.get("line", "?")
+                        text = t.get("text", "")
+                        tips_lines.append(f"{idx}. {text} (see Line {line} [{ts}])")
+
+                messages.append({
+                    "type": "text",
+                    "text": "\n".join(tips_lines)
+                })
+
+            return messages
         else:
             # Fallback for old string format
             return [

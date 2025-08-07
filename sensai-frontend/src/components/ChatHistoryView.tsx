@@ -76,6 +76,120 @@ const ChatHistoryView: React.FC<ChatHistoryViewProps> = ({
 }) => {
     const chatContainerRef = useRef<HTMLDivElement>(null);
 
+    // Parse rubric and tips from a plain-text block produced by the backend
+    const parseRubricAndTips = (text: string) => {
+        const result: { scores?: { content: number; structure: number; clarity: number; delivery: number }, tips: Array<{ idx: number; text: string; line?: number; ts?: string }>} = { tips: [] };
+        const scoreMatch = text.match(/Rubric Scores:\s*Content\s+([0-9.]+)\/5,\s*Structure\s+([0-9.]+)\/5,\s*Clarity\s+([0-9.]+)\/5,\s*Delivery\s+([0-9.]+)\/5/i);
+        if (scoreMatch) {
+            result.scores = {
+                content: parseFloat(scoreMatch[1]),
+                structure: parseFloat(scoreMatch[2]),
+                clarity: parseFloat(scoreMatch[3]),
+                delivery: parseFloat(scoreMatch[4]),
+            };
+        }
+        const tipsStart = text.indexOf('Tips:');
+        if (tipsStart !== -1) {
+            const tipsBlock = text.slice(tipsStart).split('\n').slice(1);
+            tipsBlock.forEach((line) => {
+                const tipMatch = line.match(/^\s*(\d+)\.\s+(.*?)(?:\s*\(see\s+Line\s+(\d+)\s*\[(\d{2}:\d{2})\]\))?\s*$/i);
+                if (tipMatch) {
+                    result.tips.push({
+                        idx: parseInt(tipMatch[1], 10),
+                        text: tipMatch[2].trim(),
+                        line: tipMatch[3] ? parseInt(tipMatch[3], 10) : undefined,
+                        ts: tipMatch[4] || undefined,
+                    });
+                }
+            });
+        }
+        if (!result.scores && result.tips.length === 0) return null;
+        return result;
+    };
+
+    const scrollToTranscriptLine = (line: number) => {
+        const target = document.getElementById(`transcript-line-${line}`);
+        if (target && chatContainerRef.current) {
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+    };
+
+    const RubricTipsBlock: React.FC<{ text: string }> = ({ text }) => {
+        const parsed = parseRubricAndTips(text);
+        if (!parsed) return <pre className="text-sm break-words whitespace-pre-wrap break-anywhere font-sans">{text}</pre>;
+        const scoreChipClass = (s: number) => {
+            const base = "px-2 py-1 rounded-xl text-xs";
+            const isThree = Math.abs(s - 3) < 0.06; // treat ~3.0 as 3/5
+            return isThree ? `${base} bg-yellow-500 text-black` : `${base} bg-[#262626]`;
+        };
+        return (
+            <div className="space-y-3">
+                {parsed.scores && (
+                    <div className="flex flex-wrap gap-2">
+                        <span className={scoreChipClass(parsed.scores.content)}>Content {parsed.scores.content}/5</span>
+                        <span className={scoreChipClass(parsed.scores.structure)}>Structure {parsed.scores.structure}/5</span>
+                        <span className={scoreChipClass(parsed.scores.clarity)}>Clarity {parsed.scores.clarity}/5</span>
+                        <span className={scoreChipClass(parsed.scores.delivery)}>Delivery {parsed.scores.delivery}/5</span>
+                    </div>
+                )}
+                {parsed.tips.length > 0 && (
+                    <ul className="list-disc pl-5 space-y-1">
+                        {parsed.tips.map(t => (
+                            <li key={t.idx} className="text-sm">
+                                {t.text} {t.line ? (
+                                    <button
+                                        className="underline ml-1"
+                                        onClick={() => scrollToTranscriptLine(t.line!)}
+                                        aria-label={`Go to transcript line ${t.line}`}
+                                    >
+                                        (Line {t.line}{t.ts ? ` [${t.ts}]` : ''})
+                                    </button>
+                                ) : null}
+                            </li>
+                        ))}
+                    </ul>
+                )}
+            </div>
+        );
+    };
+
+    const TranscriptWithAnchors: React.FC<{ text: string }> = ({ text }) => {
+        const lines = text.split('\n');
+        const hasLineFormat = lines.some(l => /^(?:Line\s+\d+\s+\[\d{2}:\d{2}\]:|\*\*\[\d{2}:\d{2}\]\*\*)/.test(l));
+        if (!hasLineFormat) {
+            return <pre className="text-sm break-words whitespace-pre-wrap break-anywhere font-sans">{text}</pre>;
+        }
+        const headerIsTranscription = /^\*\*🎤 Your Transcription:\*\*$/.test(lines[0]?.trim());
+        const startIdx = headerIsTranscription ? 1 : 0;
+        return (
+            <div className="space-y-1 text-sm">
+                {headerIsTranscription && (
+                    <div className="mb-2 font-light">🎤 Your Transcription:</div>
+                )}
+                {lines.slice(startIdx).map((l, i) => {
+                    const m = l.match(/^Line\s+(\d+)\s+\[(\d{2}:\d{2})\]:\s*(.*)$/);
+                    if (m) {
+                        const ln = parseInt(m[1], 10);
+                        return (
+                            <div id={`transcript-line-${ln}`} key={`ln-${ln}`} className="scroll-mt-24">
+                                <span className="opacity-80">Line {ln} [{m[2]}]:</span> {m[3]}
+                            </div>
+                        );
+                    }
+                    const m2 = l.match(/^\*\*\[(\d{2}:\d{2})\]\*\*\s+(.*)$/);
+                    if (m2) {
+                        return (
+                            <div key={`ts-${i}`}>
+                                <span className="opacity-80">[{m2[1]}]:</span> {m2[2]}
+                            </div>
+                        );
+                    }
+                    return <div key={`raw-${i}`}>{l}</div>;
+                })}
+            </div>
+        );
+    };
+
     // State for current thinking message
     const [currentThinkingMessage, setCurrentThinkingMessage] = useState("");
     // State to track animation transition
@@ -359,13 +473,24 @@ const ChatHistoryView: React.FC<ChatHistoryViewProps> = ({
                                     ) : (
                                         <div>
                                             {message.sender === 'ai' ? (
-                                                <div className="text-sm font-sans break-words break-anywhere markdown-content">
-                                                    <Markdown
-                                                        remarkPlugins={[remarkGfm]}
-                                                    >
-                                                        {message.content}
-                                                    </Markdown>
-                                                </div>
+                                                (() => {
+                                                    const content = message.content || '';
+                                                    const looksLikeRubric = /Rubric Scores:/i.test(content) || /Tips:/i.test(content);
+                                                    const looksLikeTranscript = /\bLine\s+\d+\s+\[\d{2}:\d{2}\]:/.test(content) || /\*\*\[\d{2}:\d{2}\]\*\*/.test(content);
+                                                    if (looksLikeRubric) {
+                                                        return <RubricTipsBlock text={content} />;
+                                                    }
+                                                    if (looksLikeTranscript) {
+                                                        return <TranscriptWithAnchors text={content} />;
+                                                    }
+                                                    return (
+                                                        <div className="text-sm font-sans break-words break-anywhere markdown-content">
+                                                            <Markdown remarkPlugins={[remarkGfm]}>
+                                                                {content}
+                                                            </Markdown>
+                                                        </div>
+                                                    );
+                                                })()
                                             ) : (
                                                 <pre className="text-sm break-words whitespace-pre-wrap break-anywhere font-sans">{message.content}</pre>
                                             )}
