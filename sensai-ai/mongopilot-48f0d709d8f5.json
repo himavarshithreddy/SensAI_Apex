@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "mongopilot",
+  "private_key_id": "48f0d709d8f580c9fe5e0bed29341113771971ae",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCPF+npJNgDlm9W\n3NiCTHTT9SDJeuc04JtAgkDdIRyo9GkzoYJBZJ6DgHphLLs/D6Chs0nL60pmtZ/S\nHONLAQQsPNynX+4DSO2MwqNMDjr4a/MrjT/GrhI0IAcH+Lrpb9VbYdHKNdJsn48k\n7XGOIH36LZZK0hyyoWgtuH4nvukhmDcQrG+1jiZtjMBQxEtv2fLhG7aeff72YLSl\nGTbCp4zvdIhmezSblRqyBCT7dUYp/AOCMmnhshBM4TWiBW8av/kcAzPNbceseIpP\nrPlt0W1FXo8VXghU1tCGz2pCGiPz2pi/c6diKjulh/Xb2GG8Gsxnj/cDIGNkNCFb\nv9ni+vTlAgMBAAECggEABHogkPFcqtwRlrupMIZ430rboEIuqrpeUSniIqkPDwA6\nrGlgvHAL/5xM9+5g22u/QF/uLqmpdcY3/mh1+hpJiaLL2pbHSSYGfLF4T4BgevZR\nsOql9K7sleHspmSzYGtl1wqb+EIv18M0RNkDBQniNyom+idRy4r+SfPsSo0QGUNw\ndxjiGmIji0ZkwrD81SzrEO5jYtQJMiyU8FjaqV3XhqUTsVA63vchQgpi7V48GfkB\nhEhDNnAR+w3K+r0LNbRV6h3EmbeBvHdTDvyHnPTjRQyEmO/+XVydcfoCXeqsja2F\nbVzUqp58AkhYu9U8fvK6+BbriSefflfsHvBKWyKyoQKBgQDCxiWPM5foIlExr/in\n5SBYOqK3t04YVCF1ngGpuUwQiQN7cclI2Kly1vlRyJkvxtROHu37K3Jv64igcovZ\n50aH0QBezbxCq7Xy8RQHbDMMiO/6BMKFA9HDh1k0XFdeSuedyspOXYU+UT9jNIXA\nrJQkKHcCs4thjLJHqLkgIl8R1QKBgQC8Eu0aJ2rMMaWMXshTzmxrCitNB9gxRDO/\nAV/2IXPYOiuX3MvdwQw2iP/XqVHijLdI2/XHdBs+XAF/VU0EyKlegmutTJYPFnnd\nTssPKPIPV+TLcQp2+YEMbLWHHr+nlxYsmN3Hs6l31XTUTQ/LbGJmOX5ApVUhDtNB\nZxFNBPTO0QKBgQC/ruOt37ei44sGnEjZatv/GI2kwghgVwOqzfqS/uIF7+F2blAK\nmfeBJmGtg/6GD2ZHD5djtalkzebjCHfr1fkKlryHkG+zKWviEDGG8Iv4zRdm9aI9\n57lbdWtr5WiySoNRPg8FOnJ0Ft+MEVeEfBM61nvxM6N7OE0HytuN7WWklQKBgBDq\nCtTdUqeGl4LmS1HuMKX3xikpWXIk1hqJfx3dqFN798uymcsZv4VwEMJOggTD7v/o\neFQ1xvV2xNO00jZp7YGIbTKqvpwgw1j56x0z64EhwHvjcLN+gPKjHDhItafW2LGu\nFdQN/mG+msE1JQSAfOEArrAVrnBIqwsov8+TcIjhAoGAddmzkVH8q7vT/qX5Zi06\nWmVBNZXyeaAeRxkik5LP4hiACskMOQXkFeWlRntpR6luhw6gpU//0FG/wxEjDj/Q\nTszJGzF2TmT52hNpg7x5Sp/ykX7W5rqG8Y+OHfS5HAobqZFG7gOBYUDTw/TQ6RKU\nP0vCVzzEeKLsgD2TYqnL/LU=\n-----END PRIVATE KEY-----\n",
+  "client_email": "hyperverge@mongopilot.iam.gserviceaccount.com",
+  "client_id": "110634140676764976125",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/hyperverge%40mongopilot.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
