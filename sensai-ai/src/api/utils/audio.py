@@ -263,6 +263,18 @@ def analyze_whisper_metrics(whisper_result) -> dict:
                         })
                         break
         
+        # Extract all words data for pronunciation analysis
+        words_data = []
+        for segment in segments:
+            words = segment.get("words", [])
+            for word_info in words:
+                words_data.append({
+                    "word": word_info.get("word", "").strip(),
+                    "probability": word_info.get("probability", 0),
+                    "start": word_info.get("start", 0),
+                    "end": word_info.get("end", 0)
+                })
+        
         # ENHANCED STATISTICAL ANALYSIS
         if confidence_data:
             confidences = [item["confidence"] for item in confidence_data]
