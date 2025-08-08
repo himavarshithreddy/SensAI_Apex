@@ -1,5 +1,6 @@
 from ast import List
 import os
+import base64
 import tempfile
 import random
 from collections import defaultdict
@@ -55,13 +56,28 @@ from api.utils.s3 import (
     download_file_from_s3_as_bytes,
     get_media_upload_s3_key_from_uuid,
 )
-from api.utils.audio import prepare_audio_input_for_ai, transcribe_audio_with_whisper
+from api.utils.audio import prepare_audio_input_for_ai, transcribe_audio_with_whisper, quick_transcribe_chunk
 from api.settings import tracer
 from opentelemetry.trace import StatusCode, Status
 from openinference.instrumentation import using_attributes
 from api.utils.google_services import get_user_audio_message_for_chat_history_google
 
 router = APIRouter()
+
+
+class AudioChunkRequest(BaseModel):
+    audio_base64: str = Field(description="Base64-encoded WAV audio chunk")
+
+
+@router.post("/transcribe/chunk")
+async def transcribe_chunk(request: AudioChunkRequest):
+    try:
+        audio_bytes = base64.b64decode(request.audio_base64)
+        text = quick_transcribe_chunk(audio_bytes)
+        return {"text": text}
+    except Exception as e:
+        logger.error(f"Error in /transcribe/chunk: {e}")
+        raise HTTPException(status_code=500, detail="Transcription failed")
 
 
 def get_user_audio_message_for_chat_history(uuid: str) -> List[Dict]:

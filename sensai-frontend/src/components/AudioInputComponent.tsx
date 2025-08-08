@@ -102,6 +102,26 @@ export default function AudioInputComponent({
     const [liveWaveformData, setLiveWaveformData] = useState<number[]>([]);
     const [snapshotWaveformData, setSnapshotWaveformData] = useState<number[]>([]);
 
+    // Live metrics state
+    const [liveRms, setLiveRms] = useState(0);
+    const [livePeak, setLivePeak] = useState(0);
+    const [liveSpeakingRateWpm, setLiveSpeakingRateWpm] = useState<number | null>(null);
+    const [liveNoiseLevel, setLiveNoiseLevel] = useState<'low' | 'moderate' | 'high'>('moderate');
+    const [liveQualityHint, setLiveQualityHint] = useState('');
+
+    // Live transcription state
+    const [liveTranscript, setLiveTranscript] = useState('');
+    const lastTranscriptSegmentRef = useRef('');
+    const isPostingChunkRef = useRef(false);
+    const lastChunkSentAtRef = useRef<number>(0);
+
+    // Smoothing/throttling refs for metrics
+    const smoothedRmsRef = useRef(0);
+    const smoothedPeakRef = useRef(0);
+    const smoothedWpmRef = useRef<number | null>(null);
+    const lastMetricsUpdateRef = useRef<number>(0);
+    const lastHintChangeAtRef = useRef<number>(0);
+
     // Refs
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const audioChunksRef = useRef<Blob[]>([]);
@@ -163,10 +183,13 @@ export default function AudioInputComponent({
             );
             mediaRecorderRef.current = mediaRecorder;
 
-            // When data becomes available, add it to our array
+            // When data becomes available, add it to our array and transcribe chunk
             mediaRecorder.ondataavailable = (event) => {
                 if (event.data.size > 0) {
                     audioChunksRef.current.push(event.data);
+                    if (isRecording) {
+                        transcribeChunk(event.data);
+                    }
                 }
             };
 
@@ -209,9 +232,10 @@ export default function AudioInputComponent({
 
             // Set recording state first
             setIsRecording(true);
+            setLiveTranscript("");
 
-            // Start recording
-            mediaRecorder.start();
+            // Start recording with 1s timeslices for live transcription
+            mediaRecorder.start(1000);
             setRecordingDuration(0);
 
             // Set timer for recording duration
@@ -267,6 +291,64 @@ export default function AudioInputComponent({
             // Update live waveform state
             setLiveWaveformData(newWaveformData);
 
+            // Compute live metrics from time-domain data
+            // Convert 0..255 to centered [-1, 1]
+            let sumSquares = 0;
+            let peakAbs = 0;
+            let activeSamples = 0;
+            for (let i = 0; i < bufferLength; i++) {
+                const centered = (dataArray[i] - 128) / 128;
+                const absVal = Math.abs(centered);
+                sumSquares += centered * centered;
+                if (absVal > peakAbs) peakAbs = absVal;
+                if (absVal > 0.06) activeSamples += 1; // simple VAD threshold
+            }
+
+            const rms = Math.sqrt(sumSquares / bufferLength);
+            // Rough speaking rate estimate mapped from activity ratio
+            const activeRatio = activeSamples / bufferLength; // 0..1
+            // Map activity ratio to WPM range ~90..190 (heuristic)
+            const estimatedWpm = Math.round(90 + (activeRatio * 100));
+
+            // Exponential moving average smoothing
+            const alpha = 0.1; // smoothing factor (less sensitive)
+            smoothedRmsRef.current = alpha * rms + (1 - alpha) * smoothedRmsRef.current;
+            smoothedPeakRef.current = alpha * peakAbs + (1 - alpha) * smoothedPeakRef.current;
+            smoothedWpmRef.current = Number.isFinite(estimatedWpm)
+                ? (smoothedWpmRef.current == null
+                    ? estimatedWpm
+                    : Math.round(alpha * estimatedWpm + (1 - alpha) * smoothedWpmRef.current))
+                : smoothedWpmRef.current;
+
+            // Throttle state updates to ~3.3Hz
+            const now = Date.now();
+            if (now - lastMetricsUpdateRef.current > 300) {
+                lastMetricsUpdateRef.current = now;
+                setLiveRms(smoothedRmsRef.current);
+                setLivePeak(smoothedPeakRef.current);
+                setLiveSpeakingRateWpm(smoothedWpmRef.current);
+
+                // Noise level heuristic based on smoothed metrics
+                let noise: 'low' | 'moderate' | 'high' = 'moderate';
+                if (smoothedRmsRef.current < 0.015 && smoothedPeakRef.current < 0.06) noise = 'low';
+                else if (smoothedRmsRef.current > 0.12 && smoothedPeakRef.current > 0.3) noise = 'high';
+                setLiveNoiseLevel(noise);
+
+                // Minimal, actionable hint with debounce
+                let hint = '';
+                if (smoothedPeakRef.current < 0.05) hint = 'Speak closer to the mic';
+                else if (smoothedPeakRef.current > 0.9) hint = 'Reduce input volume';
+                else if (noise === 'high') hint = 'Reduce background noise';
+                else if (
+                    smoothedWpmRef.current && (smoothedWpmRef.current < 100 || smoothedWpmRef.current > 200)
+                ) hint = 'Adjust speaking pace';
+
+                if (hint !== liveQualityHint && now - lastHintChangeAtRef.current > 1800) {
+                    lastHintChangeAtRef.current = now;
+                    setLiveQualityHint(hint);
+                }
+            }
+
             // Continue the animation loop
             animationFrameRef.current = requestAnimationFrame(draw);
         };
@@ -289,6 +371,86 @@ export default function AudioInputComponent({
             if (animationFrameRef.current) {
                 cancelAnimationFrame(animationFrameRef.current);
             }
+        }
+    };
+
+    // Convert AudioBuffer to WAV (16-bit PCM)
+    const convertAudioBufferToWav = (audioBuffer: AudioBuffer) => {
+        const numOfChan = audioBuffer.numberOfChannels;
+        const length = audioBuffer.length * numOfChan * 2;
+        const buffer = new ArrayBuffer(44 + length);
+        const view = new DataView(buffer);
+        const sampleRate = audioBuffer.sampleRate;
+        const channels: Float32Array[] = [];
+        for (let i = 0; i < numOfChan; i++) channels.push(audioBuffer.getChannelData(i));
+        writeString(view, 0, 'RIFF');
+        view.setUint32(4, 36 + length, true);
+        writeString(view, 8, 'WAVE');
+        writeString(view, 12, 'fmt ');
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, numOfChan, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * numOfChan * 2, true);
+        view.setUint16(32, numOfChan * 2, true);
+        view.setUint16(34, 16, true);
+        writeString(view, 36, 'data');
+        view.setUint32(40, length, true);
+        let pos = 44;
+        for (let i = 0; i < audioBuffer.length; i++) {
+            for (let ch = 0; ch < numOfChan; ch++) {
+                const sample = Math.max(-1, Math.min(1, channels[ch][i]));
+                const value = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+                view.setInt16(pos, value, true);
+                pos += 2;
+            }
+        }
+        return buffer;
+    };
+
+    const writeString = (view: DataView, offset: number, str: string) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    };
+
+    // Send chunk for live transcription
+    const transcribeChunk = async (blob: Blob) => {
+        const now = Date.now();
+        // Throttle to once every 1500ms
+        if (now - lastChunkSentAtRef.current < 1500 || isPostingChunkRef.current) return;
+        isPostingChunkRef.current = true;
+        try {
+            const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+            const arrayBuffer = await blob.arrayBuffer();
+            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            const wavBuffer = convertAudioBufferToWav(audioBuffer);
+            const wavBlob = new Blob([wavBuffer], { type: 'audio/wav' });
+            const base64Data = await new Promise<string>((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    const result = reader.result as string;
+                    resolve(result.split(',')[1]);
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(wavBlob);
+            });
+            const resp = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/ai/transcribe/chunk`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ audio_base64: base64Data })
+            });
+            if (resp.ok) {
+                const data = await resp.json();
+                const text: string = (data?.text || '').trim();
+                if (text && text !== lastTranscriptSegmentRef.current) {
+                    lastTranscriptSegmentRef.current = text;
+                    setLiveTranscript(prev => (prev ? `${prev} ${text}` : text));
+                }
+                lastChunkSentAtRef.current = now;
+            }
+        } catch (err) {
+            // Silently ignore to avoid UI noise during recording
+        } finally {
+            isPostingChunkRef.current = false;
         }
     };
 
@@ -438,9 +600,9 @@ export default function AudioInputComponent({
 
     return (
         <div className="relative">
-            {/* Recording status and timer */}
+            {/* Recording status and timer (moved up space for transcript) */}
             {isRecording && (
-                <div className="absolute -top-10 left-0 right-0 text-center flex items-center justify-center z-20">
+                <div className="absolute -top-12 left-0 right-0 text-center flex items-center justify-center z-20">
                     <div className="bg-black/80 rounded-full px-4 py-2 shadow-md flex items-center">
                         <div className="w-2 h-2 bg-red-500 rounded-full mr-2 animate-pulse"></div>
                         <span className="text-red-500 font-light text-sm">Recording {formatTime(recordingDuration)}</span>
@@ -466,6 +628,22 @@ export default function AudioInputComponent({
                             Delete
                         </button>
                     </div>
+                </div>
+            )}
+
+            {/* Live transcript and quality hint (minimal, above bar) */}
+            {isRecording && (
+                <div className="mb-2 px-1">
+                    {liveTranscript && (
+                        <div className="text-white/80 text-xs font-light truncate" title={liveTranscript}>
+                            {liveTranscript}
+                        </div>
+                    )}
+                    {liveQualityHint && (
+                        <div className="text-white/60 text-[11px] font-light mt-1">
+                            {liveQualityHint}
+                        </div>
+                    )}
                 </div>
             )}
 
@@ -557,6 +735,8 @@ export default function AudioInputComponent({
                     </div>
                 </div>
             </div>
+
+            {/* (moved transcript above) */}
         </div>
     );
 } 

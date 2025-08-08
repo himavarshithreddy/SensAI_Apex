@@ -1251,6 +1251,41 @@ def get_whisper_model():
     return _whisper_model
 
 
+def quick_transcribe_chunk(audio_data: bytes) -> str:
+    """
+    Fast transcription for short audio chunks. Returns plain text only.
+    Optimized for latency: minimal options, no extra analysis.
+    """
+    try:
+        model = get_whisper_model()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_file.write(audio_data)
+            temp_file.flush()
+            temp_audio_path = temp_file.name
+        try:
+            result = model.transcribe(
+                temp_audio_path,
+                language="en",
+                task="transcribe",
+                verbose=False,
+                word_timestamps=False,
+                temperature=0.0,
+                beam_size=1,
+                best_of=1,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.8,
+            )
+            text = (result.get("text") or "").strip()
+            return text
+        finally:
+            try:
+                os.remove(temp_audio_path)
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.warning(f"quick_transcribe_chunk failed: {exc}")
+        return ""
+
 def transcribe_audio_with_whisper(audio_data: bytes) -> str:
     """
     Transcribe audio using Local Whisper model
